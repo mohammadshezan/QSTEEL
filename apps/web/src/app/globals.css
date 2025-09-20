@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #0b1220;
+  --foreground: #e5e7eb;
+}
+
+html, body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+.leaflet-container { background: #0b1220; }
+.pulse-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #10B981; box-shadow: 0 0 0 rgba(16,185,129, 0.7);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(16,185,129, 0.7); }
+  70% { box-shadow: 0 0 0 10px rgba(16,185,129, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(16,185,129, 0); }
+}
