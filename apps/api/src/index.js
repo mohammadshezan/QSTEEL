@@ -79,6 +79,31 @@ async function initRedis() {
 }
 initRedis();
 
+// Friendly root route
+app.get('/', (req, res) => {
+  const base = `${req.protocol}://${req.get('host')}`;
+  res.json({
+    name: 'QSTEEL API',
+    status: 'ok',
+    time: new Date().toISOString(),
+    docs: 'https://github.com/mohammadshezan/QSTEEL',
+    endpoints: {
+      login: { method: 'POST', url: `${base}/auth/login`, body: { email: 'admin@sail.test', otp: '123456' } },
+      kpis: { method: 'GET', url: `${base}/kpis`, auth: 'Bearer <token>' },
+      mapRoutes: { method: 'GET', url: `${base}/map/routes?cargo=ore&loco=diesel&grade=0&tonnage=3000&routeKey=BKSC-DGR`, auth: 'Bearer <token>' },
+      alerts: { method: 'GET', url: `${base}/alerts`, auth: 'Bearer <token>' },
+      healthz: { method: 'GET', url: `${base}/healthz` },
+    },
+  });
+});
+
+// Unauthenticated health probe
+app.get('/healthz', async (req, res) => {
+  let redisConnected = false;
+  try { if (redis) { const pong = await redis.ping(); redisConnected = pong === 'PONG'; } } catch {}
+  res.json({ ok: true, uptimeSec: Math.floor(process.uptime()), prismaConnected: !!prisma, redisConnected });
+});
+
 async function cacheGet(key) {
   try { if (!redis) return null; const v = await redis.get(key); return v ? JSON.parse(v) : null; } catch { return null; }
 }
