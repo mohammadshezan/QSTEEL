@@ -1,4 +1,5 @@
 import "./globals.css";
+import "leaflet/dist/leaflet.css"; // global CSS from a node_module must be imported from a root layout
 import type { Metadata } from "next";
 import Nav from "@/components/Nav";
 import ClientShell from "@/app/shell";

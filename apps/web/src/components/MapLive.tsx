@@ -1,6 +1,5 @@
 "use client";
 import { MapContainer, TileLayer, Marker, Popup, Polyline } from "react-leaflet";
-import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import io from "socket.io-client";
 import { withBase, SOCKET_URL } from "@/lib/config";
