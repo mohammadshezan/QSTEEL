@@ -17,6 +17,7 @@ import { PrismaClient } from '@prisma/client';
 import Redis from 'ioredis';
 import RakeOptimizer from './optimizer.js';
 import { z } from 'zod';
+import { promisify } from 'util';
 
 const app = express();
 const httpServer = createServer(app);
@@ -317,6 +318,9 @@ function resolveUserByEmail(email) {
   if (u) return u;
   // Treat anything like customer+xyz@sail.test as a customer role (demo)
   if (/^customer(\+.*)?@sail\.test$/i.test(email)) return { id: 100, email, role: 'customer' };
+  // If customer exists in our registry, allow it
+  const c = CUSTOMERS_BY_EMAIL.get(email);
+  if (c) return { id: c.customerId, email: c.email, role: 'customer' };
   return null;
 }
 
@@ -1657,6 +1661,313 @@ io.on('connection', (socket) => {
   socket.on('chat:message', (msg) => {
     io.emit('chat:message', { ...msg, ts: Date.now(), id: crypto.randomUUID?.() || String(Date.now()) });
   });
+});
+
+// =========================
+// Customer Module (MVP)
+// =========================
+
+// In-memory stores (fallback when DB not integrated)
+const CUSTOMERS = new Map(); // key: customerId -> profile
+const CUSTOMERS_BY_EMAIL = new Map(); // key: email -> profile
+const SIGNUP_PENDING = new Map(); // key: email -> { data, createdAt }
+const ORDERS = new Map(); // key: orderId -> order
+const ORDERS_BY_CUSTOMER = new Map(); // key: customerId -> orderIds[]
+const INVOICES = new Map(); // key: orderId -> { pdfGeneratedAt, amount }
+
+const scryptAsync = promisify(crypto.scrypt);
+
+const CustomerSignupSchema = z.object({
+  name: z.string().min(2),
+  company: z.string().min(2),
+  email: z.string().email(),
+  phone: z.string().min(7),
+  gstin: z.string().min(5),
+  password: z.string().min(6)
+});
+
+// Helper: hash & verify password
+async function hashPassword(pw) {
+  const salt = crypto.randomBytes(16);
+  const key = await scryptAsync(pw, salt, 64);
+  return salt.toString('hex') + ':' + Buffer.from(key).toString('hex');
+}
+async function verifyPassword(pw, stored) {
+  const [saltHex, keyHex] = String(stored||'').split(':');
+  if (!saltHex || !keyHex) return false;
+  const salt = Buffer.from(saltHex, 'hex');
+  const key = await scryptAsync(pw, salt, 64);
+  return crypto.timingSafeEqual(Buffer.from(keyHex, 'hex'), Buffer.from(key));
+}
+
+// Alias OTP sender for customer namespace
+app.post('/auth/customer/request-otp', async (req, res) => {
+  // Reuse existing /auth/request-otp logic by forwarding
+  req.url = '/auth/request-otp';
+  app._router.handle(req, res, () => {});
+});
+
+// Signup: create pending record and email OTP
+app.post('/auth/customer/signup', async (req, res) => {
+  const parsed = CustomerSignupSchema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid payload', issues: parsed.error.issues });
+  const { name, company, email, phone, gstin, password } = parsed.data;
+  if (CUSTOMERS_BY_EMAIL.has(email)) return res.status(409).json({ error: 'Email already registered' });
+  const passwordHash = await hashPassword(password);
+  SIGNUP_PENDING.set(email, { data: { name, company, email, phone, gstin, passwordHash }, createdAt: Date.now() });
+  // send OTP using existing helper endpoint to keep behavior consistent
+  try {
+    await otpSet(email, String(Math.floor(100000 + Math.random()*900000)), 5*60);
+  } catch {}
+  // Try SMTP if configured
+  try {
+    const SMTP_HOST = process.env.SMTP_HOST || '';
+    const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+    const SMTP_USER = process.env.SMTP_USER || '';
+    const SMTP_PASS = process.env.SMTP_PASS || '';
+    const SMTP_FROM = process.env.SMTP_FROM || 'noreply@qsteel.local';
+    const disableEmail = process.env.DISABLE_EMAIL === '1' || (!SMTP_HOST || !SMTP_USER || !SMTP_PASS);
+    const pending = await otpGet(email);
+    if (!disableEmail && pending?.code) {
+      const transporter = nodemailer.createTransport({ host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_PORT === 465, auth: { user: SMTP_USER, pass: SMTP_PASS } });
+      const info = await transporter.sendMail({ from: SMTP_FROM, to: email, subject: 'Verify your QSTEEL account', html: `<p>Your verification code is <b>${pending.code}</b>. It expires in 5 minutes.</p>` });
+      return res.json({ ok: true, stage: 'otp_sent', messageId: info.messageId });
+    }
+  } catch {}
+  return res.json({ ok: true, stage: 'otp_generated' });
+});
+
+// Verify signup with OTP -> create account
+app.post('/auth/customer/verify-signup', async (req, res) => {
+  const schema = z.object({ email: z.string().email(), otp: z.string().regex(/^\d{6}$/) });
+  const parsed = schema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid payload', issues: parsed.error.issues });
+  const { email, otp } = parsed.data;
+  const pending = SIGNUP_PENDING.get(email);
+  if (!pending) return res.status(404).json({ error: 'No pending signup for this email' });
+  const stored = await otpGet(email);
+  if (!stored || stored.code !== otp || Date.now() > stored.expMs) return res.status(401).json({ error: 'Invalid OTP, please try again.' });
+  await otpDel(email);
+  SIGNUP_PENDING.delete(email);
+  // Create customer record
+  const customerId = crypto.randomUUID?.() || 'cust-' + Math.random().toString(36).slice(2);
+  const profile = { customerId, ...pending.data, addresses: [], paymentMethods: [], createdAt: new Date().toISOString() };
+  CUSTOMERS.set(customerId, profile);
+  CUSTOMERS_BY_EMAIL.set(profile.email, profile);
+  // Issue token for convenience
+  const token = jwt.sign({ sub: customerId, role: 'customer', email: profile.email }, JWT_SECRET, { expiresIn: '8h' });
+  return res.json({ ok: true, customerId, token });
+});
+
+// Customer login: password or OTP
+app.post('/auth/customer/login', async (req, res) => {
+  const schema = z.object({ email: z.string().email(), password: z.string().optional(), otp: z.string().regex(/^\d{6}$/).optional() });
+  const parsed = schema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid payload', issues: parsed.error.issues });
+  const { email, password, otp } = parsed.data;
+  const customer = CUSTOMERS_BY_EMAIL.get(email);
+  if (!customer) return res.status(404).json({ error: 'Customer not found' });
+  let ok = false;
+  if (password) {
+    ok = await verifyPassword(password, customer.passwordHash);
+  } else if (otp) {
+    const stored = await otpGet(email);
+    if (stored && stored.code === otp && Date.now() <= stored.expMs) { ok = true; await otpDel(email); }
+  }
+  if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+  const token = jwt.sign({ sub: customer.customerId, role: 'customer', email: customer.email }, JWT_SECRET, { expiresIn: '8h' });
+  res.json({ token, user: { id: customer.customerId, role: 'customer', email: customer.email, name: customer.name } });
+});
+
+// Profile
+app.get('/customer/profile', auth('customer'), async (req, res) => {
+  const c = CUSTOMERS.get(req.user.sub);
+  if (!c) return res.status(404).json({ error: 'Profile not found' });
+  res.json({ profile: { name: c.name, company: c.company, email: c.email, phone: c.phone, gstin: c.gstin, addresses: c.addresses, paymentMethods: c.paymentMethods } });
+});
+
+app.put('/customer/profile', auth('customer'), async (req, res) => {
+  const schema = z.object({
+    name: z.string().min(2).optional(),
+    company: z.string().min(2).optional(),
+    phone: z.string().min(7).optional(),
+    gstin: z.string().min(5).optional(),
+    addresses: z.array(z.object({ label: z.string(), line1: z.string(), city: z.string(), state: z.string(), pin: z.string() })).optional(),
+    paymentMethods: z.array(z.object({ type: z.enum(['COD','NETBANKING','UPI']), label: z.string().optional() })).optional()
+  });
+  const parsed = schema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid payload', issues: parsed.error.issues });
+  const c = CUSTOMERS.get(req.user.sub);
+  if (!c) return res.status(404).json({ error: 'Profile not found' });
+  Object.assign(c, parsed.data);
+  res.json({ ok: true });
+});
+
+// Order estimation helper
+function estimateOrder({ cargo, qtyTons, sourcePlant, destination, priority }) {
+  const plantCity = { BKSC: 'Bokaro', DGR: 'Durgapur', ROU: 'Rourkela', BPHB: 'Bhilai' }[sourcePlant] || 'Bokaro';
+  const distanceKm = getDistance(plantCity, (destination || '').split(',')[0] || 'Durgapur');
+  const ratePerKmPerTon = 2.5; // demo rate
+  const base = 500; // base handling
+  const cost = Math.round(qtyTons * distanceKm * ratePerKmPerTon + base);
+  const hours = Math.round(distanceKm / 50 + (priority === 'Urgent' ? 2 : 4));
+  const eta = new Date(Date.now() + hours * 3600 * 1000).toISOString();
+  // carbon footprint (simple): 0.022 tCO2/km for ore baseline scaled per cargo type
+  const efByCargo = { 'TMT Bars': 0.021, 'H-Beams': 0.022, 'Coils': 0.02, 'Ore': 0.024, 'Cement': 0.021 };
+  const ef = efByCargo[cargo] ?? 0.022;
+  const carbonTons = Number((ef * distanceKm).toFixed(3));
+  const ecoHint = 'Electric loco on S3 saves ~12% emissions.';
+  return { distanceKm, cost, eta, carbonTons, ecoHint };
+}
+
+// Customer creates order (or get estimateOnly)
+app.post('/customer/orders', auth('customer'), async (req, res) => {
+  const schema = z.object({
+    cargo: z.string(),
+    quantityTons: z.number().positive(),
+    sourcePlant: z.enum(['BKSC','DGR','ROU','BPHB']),
+    destination: z.string(), // City/State or PIN
+    priority: z.enum(['Normal','Urgent']).default('Normal'),
+    notes: z.string().optional(),
+    estimateOnly: z.boolean().optional()
+  });
+  const parsed = schema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid payload', issues: parsed.error.issues });
+  const { cargo, quantityTons, sourcePlant, destination, priority, notes, estimateOnly } = parsed.data;
+  const est = estimateOrder({ cargo, qtyTons: quantityTons, sourcePlant, destination, priority });
+  if (estimateOnly) return res.json({ estimate: est });
+
+  const orderId = crypto.randomUUID?.() || 'ord-' + Math.random().toString(36).slice(2);
+  const order = {
+    orderId,
+    customerId: req.user.sub,
+    cargo,
+    quantityTons,
+    sourcePlant,
+    destination,
+    priority,
+    notes: notes || '',
+    status: 'Pending', // Pending Manager Approval
+    createdAt: new Date().toISOString(),
+    estimate: est,
+    rakeId: null,
+    history: [{ ts: Date.now(), status: 'Pending' }]
+  };
+  ORDERS.set(orderId, order);
+  const arr = ORDERS_BY_CUSTOMER.get(req.user.sub) || [];
+  arr.push(orderId); ORDERS_BY_CUSTOMER.set(req.user.sub, arr);
+  // Notify managers
+  io.emit('notification', { audience: 'manager', type: 'order_created', orderId, customerId: req.user.sub, priority });
+  res.json({ ok: true, order });
+});
+
+app.get('/customer/orders', auth('customer'), async (req, res) => {
+  const ids = ORDERS_BY_CUSTOMER.get(req.user.sub) || [];
+  res.json({ orders: ids.map(id => ORDERS.get(id)).filter(Boolean) });
+});
+
+app.get('/customer/orders/:id', auth('customer'), async (req, res) => {
+  const o = ORDERS.get(req.params.id);
+  if (!o || o.customerId !== req.user.sub) return res.status(404).json({ error: 'Order not found' });
+  res.json({ order: o });
+});
+
+// Invoice PDF
+app.get('/customer/orders/:id/invoice.pdf', auth('customer'), async (req, res) => {
+  const o = ORDERS.get(req.params.id);
+  if (!o || o.customerId !== req.user.sub) return res.status(404).json({ error: 'Order not found' });
+  const amount = o.estimate?.cost || Math.round((o.quantityTons||0) * 300);
+  INVOICES.set(o.orderId, { pdfGeneratedAt: new Date().toISOString(), amount });
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="invoice-${o.orderId}.pdf"`);
+  const doc = new PDFDocument({ size: 'A4', margin: 50 });
+  doc.pipe(res);
+  doc.fontSize(18).text('QSTEEL — Invoice', { align: 'left' });
+  doc.moveDown();
+  const c = CUSTOMERS.get(o.customerId);
+  doc.fontSize(12).text(`Invoice #: INV-${o.orderId.slice(0,8).toUpperCase()}`);
+  doc.text(`Date: ${new Date().toLocaleString()}`);
+  doc.text(`Bill To: ${c?.company || c?.name} (${c?.email})`);
+  doc.moveDown();
+  doc.text(`Order ID: ${o.orderId}`);
+  doc.text(`Cargo: ${o.cargo}`);
+  doc.text(`Quantity: ${o.quantityTons} tons`);
+  doc.text(`Source: ${o.sourcePlant}`);
+  doc.text(`Destination: ${o.destination}`);
+  doc.text(`Priority: ${o.priority}`);
+  doc.moveDown();
+  doc.fontSize(14).text(`Amount Payable: ₹${amount.toLocaleString()}`);
+  doc.moveDown();
+  doc.fontSize(10).fillColor('#6B7280').text('Payment Options: COD, Net Banking, UPI (demo placeholder)');
+  doc.end();
+});
+
+// Manager queue & actions
+app.get('/manager/orders/pending', auth('manager'), async (req, res) => {
+  const list = Array.from(ORDERS.values()).filter(o => o.status === 'Pending');
+  res.json({ orders: list });
+});
+
+app.post('/manager/orders/:id/approve', auth('manager'), async (req, res) => {
+  const o = ORDERS.get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  o.status = 'Approved';
+  o.history.push({ ts: Date.now(), status: 'Approved' });
+  io.emit('notification', { audience: 'customer', email: CUSTOMERS.get(o.customerId)?.email, type: 'order_approved', orderId: o.orderId });
+  // Assign rake and schedule departure sequence: Loading -> En Route
+  const rakeId = `RK${String(Math.floor(Math.random()*9000)+1000)}`;
+  o.rakeId = rakeId;
+  // Seed a position path using presets from MOCK_DATA.routes or default
+  const routeKey = `${o.sourcePlant}-DGR`;
+  const presets = { 'BKSC-DGR': ['BKSC','Dhanbad','Asansol','Andal','DGR'], 'BKSC-ROU': ['BKSC','Purulia','ROU'], 'BKSC-BPHB': ['BKSC','Norla','BPHB'] };
+  const STN = { BKSC: [23.658, 86.151], DGR: [23.538, 87.291], Dhanbad: [23.795, 86.430], Asansol: [23.685, 86.974], Andal: [23.593, 87.242], ROU: [22.227, 84.857], Purulia: [23.332, 86.365], BPHB: [21.208, 81.379], Norla: [19.188, 82.787] };
+  const seq = presets[routeKey] || presets['BKSC-DGR'];
+  const stops = (seq || []).map(code => ({ name: code, lat: STN[code][0], lng: STN[code][1], signal: Math.random() > 0.7 ? 'red' : 'green' }));
+  MOCK_DATA.positions.push({ id: rakeId, rfid: `RFID-${Math.floor(Math.random()*1000)+100}`, status: 'Loading', speed: 0, temp: 30, cargo: o.cargo, source: o.sourcePlant, destination: o.destination, currentLocationName: seq?.[0] || 'Bokaro', stops });
+
+  setTimeout(() => {
+    o.status = 'Loading'; o.history.push({ ts: Date.now(), status: 'Loading' }); io.emit('order:update', { orderId: o.orderId, status: o.status });
+    const pos = MOCK_DATA.positions.find(p => p.id === rakeId); if (pos) pos.status = 'Loading';
+  }, 2000);
+  setTimeout(() => {
+    o.status = 'En Route'; o.history.push({ ts: Date.now(), status: 'En Route' }); io.emit('order:update', { orderId: o.orderId, status: o.status, rakeId });
+    const pos = MOCK_DATA.positions.find(p => p.id === rakeId); if (pos) { pos.status = 'En Route'; pos.speed = 40; }
+  }, 10000);
+
+  res.json({ ok: true, order: o });
+});
+
+app.post('/manager/orders/:id/reject', auth('manager'), async (req, res) => {
+  const o = ORDERS.get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  o.status = 'Rejected';
+  o.history.push({ ts: Date.now(), status: 'Rejected' });
+  io.emit('notification', { audience: 'customer', email: CUSTOMERS.get(o.customerId)?.email, type: 'order_rejected', orderId: o.orderId });
+  res.json({ ok: true, order: o });
+});
+
+// Yard-side view for assigned orders (very simple grouping by rake)
+app.get('/yard/orders', auth('yard'), async (req, res) => {
+  const assigned = Array.from(ORDERS.values()).filter(o => !!o.rakeId && (o.status === 'Approved' || o.status === 'Loading'));
+  res.json({ orders: assigned });
+});
+
+app.post('/yard/orders/:id/status', auth('yard'), async (req, res) => {
+  const schema = z.object({ status: z.enum(['Loading','Ready','Dispatched']) });
+  const parsed = schema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid payload', issues: parsed.error.issues });
+  const o = ORDERS.get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  o.status = parsed.data.status;
+  o.history.push({ ts: Date.now(), status: o.status });
+  io.emit('order:update', { orderId: o.orderId, status: o.status });
+  const pos = o.rakeId ? MOCK_DATA.positions.find(p => p.id === o.rakeId) : null;
+  if (pos) {
+    if (o.status === 'Dispatched') { pos.status = 'En Route'; pos.speed = 45; }
+    else if (o.status === 'Loading') { pos.status = 'Loading'; pos.speed = 0; }
+    else if (o.status === 'Ready') { pos.status = 'Ready'; pos.speed = 0; }
+  }
+  res.json({ ok: true, order: o });
 });
 
 // Mock IoT streamer

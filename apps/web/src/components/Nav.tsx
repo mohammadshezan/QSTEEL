@@ -48,17 +48,24 @@ export default function Nav() {
           <Link href="/planner">Planner</Link>
           <Link href="/optimizer">Optimizer</Link>
           {role==='yard' && <Link href="/yard-actions">Yard</Link>}
+          {role==='customer' && <Link href="/customer/dashboard">Customer</Link>}
           <Link href="/reports">Reports</Link>
           <Link href="/map">Map</Link>
           {role==='admin' && <Link href="/ledger">Ledger</Link>}
           {role==='admin' && <Link href="/admin/compatibility">Compatibility</Link>}
           {authed === null ? (
             // During SSR and the first client render, keep a deterministic markup
-            <Link href="/signin" className="rounded-md bg-brand-green text-black px-3 py-1">Sign in</Link>
+            <>
+              <Link href="/customer/login">Customer</Link>
+              <Link href="/signin" className="rounded-md bg-brand-green text-black px-3 py-1">Sign in</Link>
+            </>
           ) : authed ? (
             <button onClick={()=>{ localStorage.removeItem('token'); location.href='/'; }} className="rounded-md border border-white/10 px-3 py-1">Sign out</button>
           ) : (
-            <Link href="/signin" className="rounded-md bg-brand-green text-black px-3 py-1">Sign in</Link>
+            <>
+              <Link href="/customer/login">Customer</Link>
+              <Link href="/signin" className="rounded-md bg-brand-green text-black px-3 py-1">Sign in</Link>
+            </>
           )}
         </div>
       </nav>
