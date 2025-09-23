@@ -1,7 +1,7 @@
 "use client";
 import { createContext, useContext, useState } from "react";
 
-type Toast = { id: number; text: string; tone?: 'success'|'error' };
+type Toast = { id: number; text: string; tone?: 'success'|'error'|'info' };
 const ToastCtx = createContext<{ push: (t: Omit<Toast,'id'>)=>void } | null>(null);
 
 export function ToastProvider({ children }: { children: React.ReactNode }) {
@@ -15,9 +15,12 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
     <ToastCtx.Provider value={{ push }}>
       {children}
       <div className="fixed top-4 right-4 space-y-2 z-50">
-        {items.map(i=> (
-          <div key={i.id} className={`rounded-md px-4 py-2 text-sm shadow ${i.tone==='error'?'bg-red-500':'bg-green-500'} text-black`}>{i.text}</div>
-        ))}
+        {items.map(i=> {
+          const bg = i.tone==='error' ? 'bg-red-500' : i.tone==='info' ? 'bg-blue-500' : 'bg-green-500';
+          return (
+            <div key={i.id} className={`rounded-md px-4 py-2 text-sm shadow ${bg} text-black`}>{i.text}</div>
+          );
+        })}
       </div>
     </ToastCtx.Provider>
   );

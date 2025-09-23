@@ -7,6 +7,7 @@ const socket = SOCKET_URL ? io(SOCKET_URL) : io();
 
 type Rake = { id: string; name: string; route: string; status: string; cargoType: string; locomotive: string; grade: string; tonnage: number };
 type Wagon = { id: string; rake: string; type: string; cargo: string; capacityTons: number; loadedTons: number };
+type LedgerBlock = { hash: string; type: string; rakeId: string; from?: string; to?: string; cargo?: string; tonnage?: number; actor?: string; ts: number };
 
 type Props = { params: { id: string } };
 export default function RakeDetailPage({ params }: Props) {
@@ -15,6 +16,7 @@ export default function RakeDetailPage({ params }: Props) {
   const [wagons, setWagons] = useState<Wagon[]>([]);
   const [rfid, setRfid] = useState<string | null>(null);
   const [timeline, setTimeline] = useState<Array<{ ts: number; text: string }>>([]);
+  const [latestBlock, setLatestBlock] = useState<LedgerBlock | null>(null);
 
   useEffect(() => {
     const token = localStorage.getItem('token') || '';
@@ -25,6 +27,12 @@ export default function RakeDetailPage({ params }: Props) {
       .then(r=>r.json()).then((ws:any[])=> setWagons((ws||[]).filter((w:any)=> w.rake === rakeId))).catch(()=> setWagons([]));
   fetch(withBase('/positions'), { headers: { Authorization: `Bearer ${token}` } })
       .then(r=>r.json()).then((ps:any[])=> { const p = (ps||[]).find((x:any)=> x.id === rakeId); if (p?.rfid) setRfid(p.rfid); }).catch(()=>{});
+  fetch(withBase('/ledger'), { headers: { Authorization: `Bearer ${token}` } })
+      .then(r=>r.json()).then((d:any)=>{
+        const chain: LedgerBlock[] = d?.chain || d?.ledger || [];
+        const last = chain.filter(b=> b.rakeId === rakeId).sort((a,b)=> (b.ts||0)-(a.ts||0))[0] || null;
+        setLatestBlock(last);
+      }).catch(()=> setLatestBlock(null));
 
     const onAlert = (a:any) => {
       if (a?.rakeId === rakeId) setTimeline(prev => [{ ts: a.ts || Date.now(), text: a.message || 'Update' }, ...prev]);
@@ -85,6 +93,20 @@ export default function RakeDetailPage({ params }: Props) {
                 <p>{e.text}</p>
               </div>
             ))}
+          </div>
+          <div className="mt-4 border-t border-white/10 pt-3 text-sm">
+            <h4 className="font-medium mb-1">Latest ledger</h4>
+            {!latestBlock && <p className="text-gray-400">No ledger entries for this rake yet.</p>}
+            {latestBlock && (
+              <div className="space-y-1">
+                <p><span className="text-gray-400">Type:</span> {latestBlock.type}</p>
+                <p><span className="text-gray-400">From → To:</span> {latestBlock.from||'—'} → {latestBlock.to||'—'}</p>
+                <p><span className="text-gray-400">Cargo/Tons:</span> {latestBlock.cargo||'—'} / {latestBlock.tonnage||'—'}</p>
+                <p><span className="text-gray-400">Actor:</span> {latestBlock.actor||'—'}</p>
+                <p className="font-mono text-xs break-all"><span className="text-gray-400">Hash:</span> {latestBlock.hash}</p>
+                <div className="text-xs"><a className="underline" href="/ledger">Open full ledger →</a></div>
+              </div>
+            )}
           </div>
         </div>
       </div>

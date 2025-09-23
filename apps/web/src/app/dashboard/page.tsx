@@ -89,7 +89,7 @@ export default function Dashboard() {
 
   // prepare route emissions data
   const routeSeries = useMemo(() => (routes?.routes || []).map((r:any, idx:number) => ({ name: `R${idx+1}`, co2: r.co2_tons, km: r.km, status: r.status, best: idx === (routes?.eco?.bestIndex ?? -1) })), [routes]);
-  const [health, setHealth] = useState<any>(null);
+  // system health section removed
   const [forecast, setForecast] = useState<number[] | null>(null);
   const [alerts, setAlerts] = useState<any[] | null>(null);
   const [stock, setStock] = useState<any[]>([]);
@@ -279,24 +279,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Admin: system health */}
-      {role === 'admin' && (
-        <div className="rounded-xl bg-white/5 p-4 border border-white/10">
-          <div className="flex items-center justify-between">
-            <h3 className="mb-2">System Health</h3>
-            <button className="text-xs underline" onClick={async()=>{
-              const token = localStorage.getItem('token') || '';
-              const r = await fetch(withBase('/health'), { headers: { Authorization: `Bearer ${token}` } });
-              const d = await r.json(); setHealth(d);
-            }}>Check</button>
-          </div>
-          <div className="grid grid-cols-2 gap-3 text-sm">
-            <div className="rounded-md bg-white/5 border border-white/10 p-3">DB: <span className={health?.prismaConnected? 'text-brand-green':'text-brand-red'}>{String(health?.prismaConnected ?? false)}</span></div>
-            <div className="rounded-md bg-white/5 border border-white/10 p-3">Redis: <span className={health?.redisConnected? 'text-brand-green':'text-brand-red'}>{String(health?.redisConnected ?? false)}</span></div>
-            <div className="rounded-md bg-white/5 border border-white/10 p-3 col-span-2">Uptime: {health?.uptimeSec ?? '—'}s</div>
-          </div>
-        </div>
-      )}
+      {/* Admin: system health section removed by request */}
 
       <div className="rounded-xl bg-white/5 p-4 border border-white/10">
         <h3 className="mb-2">Route Emissions by Option</h3>

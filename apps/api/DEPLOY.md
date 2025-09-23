@@ -87,7 +87,7 @@ Notes:
 - If CORS_ORIGINS is empty, the API allows all origins but disables credentials.
 
 ## Health check
-- /health requires admin role; generate a demo token via /auth/login with admin@sail.test & OTP 123456, then use Authorization: Bearer <token>.
+This project currently does not expose a health endpoint.
 
 ## Socket.IO endpoint
 - The Socket.IO server runs on the same host/port as the API. In the web app, set

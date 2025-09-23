@@ -1,9 +1,26 @@
 "use client";
 import Link from "next/link";
+import { useEffect, useState } from "react";
 
 export default function Nav() {
-  const authed = typeof window !== 'undefined' && !!localStorage.getItem('token');
-  const role = typeof window !== 'undefined' ? (()=>{ try { const t=localStorage.getItem('token')||''; const p=t?JSON.parse(atob(t.split('.')[1])):null; return p?.role||'guest'; } catch { return 'guest'; } })() : 'guest';
+  // Defer auth-dependent UI to client after mount to avoid hydration mismatches
+  const [authed, setAuthed] = useState<boolean | null>(null);
+  const [role, setRole] = useState<string>('guest');
+  useEffect(() => {
+    try {
+      const token = localStorage.getItem('token') || '';
+      setAuthed(!!token);
+      if (token) {
+        const payload = JSON.parse(atob(token.split('.')[1] || '')) || {};
+        setRole(payload?.role || 'guest');
+      } else {
+        setRole('guest');
+      }
+    } catch {
+      setAuthed(false);
+      setRole('guest');
+    }
+  }, []);
   return (
     <header className="sticky top-0 z-40 backdrop-blur bg-black/30 border-b border-white/10">
       <nav className="mx-auto max-w-7xl px-4 py-3 flex items-center justify-between">
@@ -29,13 +46,19 @@ export default function Nav() {
         <div className="flex items-center gap-4 text-sm">
           <Link href="/dashboard">Dashboard</Link>
           <Link href="/planner">Planner</Link>
+          <Link href="/optimizer">Optimizer</Link>
           {role==='yard' && <Link href="/yard-actions">Yard</Link>}
           <Link href="/reports">Reports</Link>
           <Link href="/map">Map</Link>
-          {!authed ? (
+          {role==='admin' && <Link href="/ledger">Ledger</Link>}
+          {role==='admin' && <Link href="/admin/compatibility">Compatibility</Link>}
+          {authed === null ? (
+            // During SSR and the first client render, keep a deterministic markup
             <Link href="/signin" className="rounded-md bg-brand-green text-black px-3 py-1">Sign in</Link>
-          ) : (
+          ) : authed ? (
             <button onClick={()=>{ localStorage.removeItem('token'); location.href='/'; }} className="rounded-md border border-white/10 px-3 py-1">Sign out</button>
+          ) : (
+            <Link href="/signin" className="rounded-md bg-brand-green text-black px-3 py-1">Sign in</Link>
           )}
         </div>
       </nav>
